@@ -18,7 +18,7 @@ We abandoned the broken software conversion and shared-memory mapping approach e
 
 The key breakthrough is that the Allwinner ISP (`v4l2src en-awisp=1`) natively outputs **NV12** pixel format, and the hardware encoder (`omxh264videoenc`) natively expects **NV12**. By removing the software `videoconvert` step entirely from the encoding branch, we bypassed the exact buffer negotiation crash confirmed by other developers. 
 
-Furthermore, by orchestrating the process teardown with forceful system kills (`pkill -9`) rather than graceful GStreamer `PLAYING -> NULL` state transitions, we made the architecture completely immune to the `gst_pad_stop_task` teardown deadlocks that plague this SoC.
+Furthermore, by orchestrating the process teardown with forceful system kills (`pkill -9`) rather than graceful GStreamer `PLAYING -> NULL` state transitions, we made the architecture completely immune to the `gst_pad_stop_task` teardown deadlocks that plague this SoC. **Note:** This pipeline was tested and proven stable on the known-vulnerable GStreamer Core Library version **1.18.4**—proving that this architecture actively sidesteps the core library bugs rather than relying on an upstream patch.
 
 Instead of fighting GStreamer memory leaks in Python, we use a single, rock-solid GStreamer CLI subprocess (`gst-launch-1.0`) to split the hardware feed into two independent branches:
 
