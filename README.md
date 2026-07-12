@@ -1,48 +1,45 @@
 # Radxa VIP9000 Hardware-Accelerated YOLOv5 Pipeline
 
-This repository provides an ultra-optimized, zero-copy architecture for running a live camera stream and YOLOv5s person detection on Radxa boards equipped with the Allwinner ISP and Vivante VIP9000 NPU (e.g. Radxa ZERO 3W).
+This repository provides an ultra-optimized, zero-copy architecture for running a live camera stream and YOLOv5s real-time person detection on Radxa boards equipped with the Allwinner ISP and Vivante VIP9000 NPU (e.g., Radxa ZERO 3W, Cubie A7S).
 
-## The Architecture Breakthrough
+## The Goal
+The objective of this project was to achieve **Real-Time NPU Object Detection** (specifically YOLOv5s person detection) while simultaneously streaming a pristine, low-latency 1080p 30FPS camera feed over the web, without melting the CPU.
 
-In earlier iterations, reading from `/dev/video0` directly with OpenCV (`cv2.VideoCapture`) caused system hangs on reboot, green/purple tinting due to U/V channel mismatches, and massive 90% CPU overhead because Python was being used to shuffle raw 1080p frames to the encoder. 
+## The Problem: The Allwinner ISP Deadlock
+If you try to build an NPU pipeline on these boards using standard tutorials, you will hit a massive wall. Specifically, the Allwinner ISP (`en-awisp=1`) and GStreamer's memory mapping interface have severe driver-level race conditions. 
 
-**This repository completely solves these issues using a dual-branch GStreamer pipeline:**
+**What we faced:**
+1. **Kernel Panics & Lockups:** When attempting to capture video via OpenCV (`cv2.VideoCapture`), or when trying to map the GStreamer buffer into C/Python space, the pipeline deadlocks. Mutexes lock up (`__lll_lock_wait`), GStreamer throws `GST_IS_BUFFER` assertions, and the entire board freezes requiring a hard power cycle. (This is a [known issue in the Radxa community](https://forum.radxa.com/t/a7s-gstreamer-current-status-for-real-time-npu/31163)).
+2. **Color Space Glitches:** Forcing the pipeline through `videoconvert` triggers NV12/YV12 buffer sizing mismatches, resulting in horrible green and purple tints.
+3. **CPU Bottlenecks:** Forcing the CPU to handle video encoding maxes out the processor, severely throttling the NPU inference frame rate.
 
-1. **Hardware ISP Bootstrapping:** We bypass OpenCV and strictly use `v4l2src en-awisp=1` via a native GStreamer subprocess, satisfying the Allwinner ISP driver's hardware initialization checks perfectly and preventing hangs.
-2. **Zero-Copy WebRTC (H.264):** The camera frames are piped *in C++* directly to `omxh264videoenc`. This produces a pristine 8Mbps 1080p stream with 0% CPU overhead and zero green tint, pushed to MediaMTX.
-3. **`fdsink` stdout Capture:** Instead of forcing OpenCV to re-encode video, the GStreamer pipeline taps a secondary feed using `fdsink`, piping pre-converted `BGR` frames via `stdout` natively into Python. Python processes the YOLOv5 bounding boxes and serves a 640x640 MJPEG stream at `:5000` with the U/V channels explicitly corrected.
+## The Solution: Dual-Branch `fdsink` Architecture
+We abandoned the broken shared-memory mapping approach entirely and architected a custom, decoupled pipeline that bypasses the ISP driver bugs.
 
-## Features
-- **Zero-Copy Architecture**: WebRTC video encoding bypasses Python completely.
-- **Flawless Color Accuracy**: WebRTC uses native NV12. Python explicit swaps BGR to RGB to perfectly fix green and blue tints.
-- **VIP9000 NPU Inference**: Native C wrapper (`awnn_shim.c`) utilizing `libNBGlinker.so` handles YOLOv5s object detection at ~30-50ms inference time.
-- **Robust ISP Handling**: Completely immune to the `/dev/video0` timeout and device-busy lockups typical to this hardware.
+Instead of fighting GStreamer memory leaks in Python, we use a single, rock-solid GStreamer CLI subprocess (`gst-launch-1.0`) to split the hardware feed into two independent branches:
 
-## Project Structure
-```text
-.
-├── npu_code/
-│   ├── awnn_shim.c      # C wrapper to interface with VIP9000 NPU
-│   ├── build.sh         # Build script for the C wrapper (compile on board)
-│   ├── npu_detect.py    # Main Flask app & fdsink stdout capture logic
-│   ├── vip_lite.h       # VIP9000 NPU Header
-│   └── yolov5s.nb       # Compiled YOLOv5s model for VIP9000
-├── scripts/
-│   └── start_all.sh     # Single-point orchestration script
-├── requirements.txt     # Python dependencies
-└── README.md            # This file
-```
+1. **Zero-Copy WebRTC (H.264):** One branch of the `tee` pipes pristine 1080p frames directly into the silicon `omxh264videoenc` hardware encoder. This streams to the web at 0% CPU load with perfect colors.
+2. **Decoupled `fdsink` Capture:** The second branch converts the frames to flat `BGR` bytes and pipes them to `stdout` via `fdsink`. Python simply reads this byte-stream safely from standard output. Because we aren't mapping shared memory buffers, the kernel deadlocks are **physically impossible** in this architecture.
 
-## Setup & Installation (On Radxa Board)
+## What's in this Repository?
+We have provided everything needed to bypass the bugs and get the Vivante VIP9000 working cleanly:
+
+* `npu_sdk/` - Contains all the proprietary Allwinner/Vivante C-headers and `.so` shared libraries (`libNBGlinker.so`, `libVIPhal.so`, etc.) extracted directly from the Radxa SDK. You don't need a massive Docker container; everything is here.
+* `npu_code/awnn_shim.c` - Our custom C-wrapper that communicates directly with the VIP9000 NPU, bridging the low-level C libraries to our Python server.
+* `npu_code/yolov5s.nb` - The pre-compiled, optimized YOLOv5s model for the T527/VIP9000 architecture.
+* `npu_code/npu_detect.py` - The main Flask web server. It manages the GStreamer subprocess, safely consumes the `fdsink` byte-stream, runs the NPU inference, decodes the YOLO bounding boxes, and serves the UI.
+* `scripts/start_all.sh` - The orchestration script. It kills zombie processes, boots MediaMTX, initializes the ISP, and starts the Python server.
+
+## Setup & Installation
 
 ### 1. Compile the NPU Wrapper
-The Python script needs `libawnn_npu.so` to communicate with the NPU. Compile this on the Radxa board:
+You must compile the C-wrapper on your Radxa board to generate the `libawnn_npu.so` library that Python uses:
 ```bash
 cd npu_code
 bash build.sh
 ```
 
-### 2. Install Python Dependencies
+### 2. Install Dependencies
 ```bash
 python3 -m venv yolo_env
 source yolo_env/bin/activate
@@ -50,22 +47,20 @@ pip install -r requirements.txt
 ```
 
 ### 3. Setup MediaMTX
-Ensure you have the `mediamtx` binary located in `/home/radxa/` (or update `scripts/start_all.sh` with your correct path).
+Ensure you have the `mediamtx` binary downloaded and placed in `/home/radxa/` (or update `scripts/start_all.sh` with your correct path).
 
-## Running the Application
-
-Simply execute the orchestration script. It handles killing zombie processes, booting MediaMTX, initializing the ISP, starting the hardware encoder, and spinning up the NPU Flask server.
-
+### 4. Run the Pipeline
 ```bash
 bash scripts/start_all.sh
 ```
 
 **Access Points:**
-- **Raw WebRTC Stream (Low Latency):** `http://<RADXA_IP>:8889/camera`
+- **Raw WebRTC Stream (0% CPU):** `http://<RADXA_IP>:8889/camera`
 - **NPU Web UI (Bounding Boxes):** `http://<RADXA_IP>:5000`
-- **NPU MJPEG Stream:** `http://<RADXA_IP>:5000/video_feed`
 
-## Performance Tuning
-Currently, the Python Global Interpreter Lock (GIL) and stdout reading limits the NPU bounding box stream to ~30 FPS. The CPU cores may sit at higher utilization doing Numpy reshaping. To push the board to its absolute theoretical maximum (40-50+ FPS with sub-10% CPU load), the `npu_detect.py` script should be rewritten entirely in C++ as a native GStreamer plugin (e.g. `awinnsink`), keeping the entire pipeline entirely in C-space.
+## Future Improvements & Roadmap
+While this hybrid Python/C architecture completely fixes the crashing bugs and achieves a stable ~15 FPS on the web UI, the Python Global Interpreter Lock (GIL) limits how fast we can push the NPU. 
 
-**Thermal Note:** The Allwinner chip easily reaches 70°C+ during load. It is highly recommended to attach an active cooling fan and heatsink to prevent thermal throttling.
+**Next Steps for Maximum Performance:**
+1. **Full C++ Port:** We plan to move the `npu_detect.py` logic entirely into C++ as a native GStreamer plugin (e.g., `awinnsink`). By keeping the entire pipeline in C-space and bypassing Python entirely, the VIP9000 NPU can easily process **40 to 60+ FPS** with sub-10% CPU load.
+2. **Thermal Management:** The Allwinner chip reaches 70°C+ during NPU load, causing thermal throttling. Active cooling (heatsink + fan) is strictly required for sustained maximum framerates.
