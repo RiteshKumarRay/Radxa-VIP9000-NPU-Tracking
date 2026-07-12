@@ -1,28 +1,22 @@
-import os
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-
-"""
-npu_detect.py — Person detection using YOLOv5s on the Vivante VIP9000 NPU
-via libawnn_npu.so (wraps libNBGlinker + libVIPhal).
-Serves annotated MJPEG video over Flask at port 5000.
-"""
 import sys
 import ctypes
 import time
 import threading
+import subprocess
 import cv2
 import numpy as np
-from flask import Flask, Response
+from flask import Flask, Response, render_template_string
 
 # ── Paths ─────────────────────────────────────────────────────────────
 NPU_LIB  = "/home/radxa/npu/libawnn_npu.so"
 MODEL_NB = "/home/radxa/npu/yolov5s.nb"
-RTSP_URL = "rtsp://127.0.0.1:8554/camera"
 
 INPUT_H = 640
 INPUT_W = 640
+FRAME_W = 1920
+FRAME_H = 1080
+FRAME_SIZE = FRAME_W * FRAME_H * 3
 
-# YOLOv5 COCO anchor boxes for 640-input (P3/P4/P5)
 ANCHORS = [
     [(10, 13), (16, 30), (33, 23)],      # small (80×80)
     [(30, 61), (62, 45), (59, 119)],     # medium (40×40)
@@ -52,62 +46,13 @@ lib.awnn_get_output_elements.argtypes = [ctypes.c_void_p, ctypes.c_int]
 lib.awnn_get_output_elements.restype  = ctypes.c_uint32
 
 # ── Shared state ──────────────────────────────────────────────────────
-raw_frame   = None
-latest_jpeg = None
-lock        = threading.Lock()
-frame_ready = threading.Event()
+latest_frame = None
+latest_detections = []
+frame_lock = threading.Lock()
+det_lock = threading.Lock()
+running = True
 
-# ── Flask app ─────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NPU Person Detection</title>
-  <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { background:#0a0a0f; color:#e0e0ff;
-           font-family:'Segoe UI',sans-serif;
-           display:flex; flex-direction:column; align-items:center;
-           min-height:100vh; padding:20px; }
-    h1 { font-size:1.6rem; font-weight:600; margin-bottom:12px;
-         background:linear-gradient(90deg,#7c3aed,#2563eb);
-         -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-    .badge { background:#1e1b4b; border:1px solid #4c1d95; border-radius:20px;
-             padding:4px 14px; font-size:0.75rem; color:#a5b4fc; margin-bottom:20px; }
-    .frame { border:2px solid #312e81; border-radius:12px; overflow:hidden;
-             box-shadow:0 0 40px rgba(124,58,237,0.3); max-width:100%; }
-    .frame img { display:block; width:100%; max-width:960px; height:auto; }
-    .footer { margin-top:16px; font-size:0.7rem; color:#6366f1; opacity:0.6; }
-  </style>
-</head>
-<body>
-  <h1>🎯 VIP9000 NPU · Person Detection</h1>
-  <div class="badge">3 TOPS · YOLOv5s · Live</div>
-  <div class="frame"><img src="/video_feed" alt="Connecting..."></div>
-  <div class="footer">NPU-accelerated inference · Live MJPEG stream · port 5000</div>
-</body>
-</html>'''
-
-@app.route('/')
-def index():
-    return HTML
-
-def generate():
-    while True:
-        if latest_jpeg is None:
-            time.sleep(0.05)
-            continue
-        with lock:
-            frame = latest_jpeg
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.033)
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # ── Sigmoid ───────────────────────────────────────────────────────────
 def sigmoid(x):
@@ -116,10 +61,6 @@ def sigmoid(x):
 # ── YOLOv5 decoder ────────────────────────────────────────────────────
 def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
                   conf_thresh=0.25, iou_thresh=0.45):
-    """
-    Decode 3-head YOLOv5 output into person detections.
-    Each head shape: (3, Hg, Wg, 5+NC), stride=8/16/32.
-    """
     all_boxes  = []
     all_scores = []
 
@@ -135,28 +76,24 @@ def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
         arr = arr.reshape(3, grid_h, grid_w, 5 + NC)
         arr = sigmoid(arr)
 
-        # Build grid
         gy, gx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
 
         for a_i, (aw, ah) in enumerate(anchors):
-            pred = arr[a_i]  # (grid_h, grid_w, 5+NC)
+            pred = arr[a_i]
 
-            obj  = pred[..., 4]          # objectness
-            cls  = pred[..., 5:]         # class probs
-            person_conf = obj * cls[..., PERSON_IDX]  # (Hg, Wg)
+            obj  = pred[..., 4]
+            cls  = pred[..., 5:]
+            person_conf = obj * cls[..., PERSON_IDX]
 
-            # Lowered threshold to see if we get faint detections
-            mask = person_conf > 0.01
+            mask = person_conf > conf_thresh
             if not mask.any():
                 continue
 
-            # Decode boxes for valid anchors
-            px = (pred[mask, 0] * 2 - 0.5 + gx[mask]) * stride  # pixel cx
-            py = (pred[mask, 1] * 2 - 0.5 + gy[mask]) * stride  # pixel cy
-            pw = (pred[mask, 2] * 2) ** 2 * aw                   # pixel w
-            ph = (pred[mask, 3] * 2) ** 2 * ah                   # pixel h
+            px = (pred[mask, 0] * 2 - 0.5 + gx[mask]) * stride
+            py = (pred[mask, 1] * 2 - 0.5 + gy[mask]) * stride
+            pw = (pred[mask, 2] * 2) ** 2 * aw
+            ph = (pred[mask, 3] * 2) ** 2 * ah
 
-            # Scale to original image (Letterbox un-padding)
             scale = min(INPUT_W / orig_w, INPUT_H / orig_h)
             dw = (INPUT_W - orig_w * scale) / 2
             dh = (INPUT_H - orig_h * scale) / 2
@@ -178,7 +115,6 @@ def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
     if not all_boxes:
         return []
 
-    # NMS
     indices = cv2.dnn.NMSBoxes(
         [[int(b[0]), int(b[1]), int(b[2]), int(b[3])] for b in all_boxes],
         all_scores, conf_thresh, iou_thresh)
@@ -202,17 +138,17 @@ def draw_detections(frame, detections):
     for d in detections:
         x1, y1, x2, y2 = d['bbox']
         score = d['score']
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 80), 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 80), 3)
         label = f"Person {score:.2f}"
-        lw, lh = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-        cv2.rectangle(frame, (x1, y1 - lh - 8), (x1 + lw + 6, y1), (0, 200, 60), -1)
-        cv2.putText(frame, label, (x1 + 3, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+        lw, lh = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        cv2.rectangle(frame, (x1, y1 - lh - 10), (x1 + lw + 10, y1), (0, 200, 60), -1)
+        cv2.putText(frame, label, (x1 + 5, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2, cv2.LINE_AA)
     return frame
 
 # ── NPU inference thread ──────────────────────────────────────────────
-def npu_inference():
-    global latest_jpeg, raw_frame
+def npu_inference_thread():
+    global latest_detections, running
 
     print("[NPU] Initializing VIP9000 NPU...", flush=True)
     lib.awnn_init()
@@ -230,58 +166,44 @@ def npu_inference():
     frame_count = 0
     fps_timer   = time.time()
 
-    while True:
-        frame_ready.wait(timeout=2.0)
-        frame_ready.clear()
-
-        with lock:
-            frame = raw_frame
+    while running:
+        with frame_lock:
+            frame = latest_frame
+            
         if frame is None:
+            time.sleep(0.01)
             continue
 
-        orig_h, orig_w = frame.shape[:2]
+        orig_h, orig_w = FRAME_H, FRAME_W
 
         # Preprocess: Letterbox → RGB → uint8 (NCHW)
         scale = min(INPUT_W / orig_w, INPUT_H / orig_h)
         nw, nh = int(orig_w * scale), int(orig_h * scale)
         img_resized = cv2.resize(frame, (nw, nh))
         
-        # Pad with gray (114)
         img_pad = np.full((INPUT_H, INPUT_W, 3), 114, dtype=np.uint8)
         dw = (INPUT_W - nw) // 2
         dh = (INPUT_H - nh) // 2
         img_pad[dh:dh+nh, dw:dw+nw, :] = img_resized
 
+        # FIX GREEN TINT for the NPU explicitly since we get BGR
         img_rgb = cv2.cvtColor(img_pad, cv2.COLOR_BGR2RGB)
+        
         inp = img_rgb.transpose(2, 0, 1).astype(np.uint8).flatten()
         buf = inp.ctypes.data_as(ctypes.c_void_p)
         bufs = (ctypes.c_void_p * 1)(buf)
 
-        # Run NPU
         t0 = time.time()
         lib.awnn_set_input_buffers(ctx, bufs)
         lib.awnn_run(ctx)
         raw_out = lib.awnn_get_output_buffers(ctx)
-        t1 = time.time()
+        inf_ms = int((time.time() - t0) * 1000)
 
-        # Decode
-        try:
-            dets = decode_yolov5(raw_out, out_elems, orig_h, orig_w)
-        except Exception as e:
-            print(f"[NPU] Decode error: {e}", flush=True)
-            dets = []
+        dets = decode_yolov5(raw_out, out_elems, orig_h, orig_w)
 
-        # Annotate frame
-        annotated = draw_detections(frame.copy(), dets)
+        with det_lock:
+            latest_detections = dets
 
-        # FPS overlay
-        inf_ms = int((t1 - t0) * 1000)
-        overlay = f"NPU {inf_ms}ms | {len(dets)} person(s)"
-        cv2.rectangle(annotated, (0, 0), (310, 32), (0, 0, 0), -1)
-        cv2.putText(annotated, overlay, (6, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 120), 1, cv2.LINE_AA)
-
-        # Log every 5 s
         frame_count += 1
         elapsed = time.time() - fps_timer
         if elapsed >= 5.0:
@@ -290,48 +212,100 @@ def npu_inference():
             frame_count = 0
             fps_timer   = time.time()
 
-        # JPEG → Flask
-        ret, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 82])
-        if ret:
-            with lock:
-                latest_jpeg = buf.tobytes()
+def read_exact(pipe, size):
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = pipe.read(size - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
 
-# ── Camera reader thread ──────────────────────────────────────────────
-def camera_reader():
-    global raw_frame
-    print("[CAM] Connecting to RTSP stream...", flush=True)
-    cap = cv2.VideoCapture(RTSP_URL)
-    while not cap.isOpened():
-        print("[CAM] Waiting for stream...", flush=True)
-        time.sleep(2)
-        cap = cv2.VideoCapture(RTSP_URL)
-    print("[CAM] Connected!", flush=True)
-    fails = 0
-    while True:
-        ret, frame = cap.read()
-        if ret:
-            fails = 0
-            with lock:
-                raw_frame = frame.copy()
-            frame_ready.set()
-        else:
-            fails += 1
-            if fails > 10:
-                print("[CAM] Reconnecting...", flush=True)
-                cap.release()
-                time.sleep(1)
-                cap = cv2.VideoCapture(RTSP_URL)
-                fails = 0
-            else:
-                time.sleep(0.05)
+def generate_mjpeg():
+    while running:
+        with frame_lock:
+            frame_out = latest_frame.copy() if latest_frame is not None else None
+        
+        with det_lock:
+            dets = list(latest_detections)
+            
+        if frame_out is not None:
+            frame_out = draw_detections(frame_out, dets)
+            
+            ret, jpeg = cv2.imencode('.jpg', frame_out)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n\r\n')
+        time.sleep(0.03)
 
-# ── Entry point ───────────────────────────────────────────────────────
-if __name__ == '__main__':
-    print("[MAIN] Starting camera reader...", flush=True)
-    threading.Thread(target=camera_reader, daemon=True).start()
+@app.route('/')
+def index():
+    return render_template_string("""
+    <html>
+      <head>
+        <title>Radxa NPU Stream</title>
+        <style>
+          body { background-color: #111; color: white; text-align: center; font-family: sans-serif; }
+          img { border: 2px solid #444; border-radius: 8px; max-width: 90%; margin-top: 20px; }
+        </style>
+      </head>
+      <body>
+        <h1>NPU Person Detection (Live)</h1>
+        <img src="/video_feed" />
+      </body>
+    </html>
+    """)
 
-    print("[MAIN] Starting NPU inference...", flush=True)
-    threading.Thread(target=npu_inference, daemon=True).start()
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    print("[MAIN] Flask on http://0.0.0.0:5000", flush=True)
-    app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
+def flask_thread():
+    app.run(host='0.0.0.0', port=5000, threaded=True, debug=False, use_reloader=False)
+
+def main():
+    global latest_frame, running
+
+    print("[MAIN] Starting GStreamer hardware encoder + stdout pipe...", flush=True)
+    
+    gst_cmd = [
+        "gst-launch-1.0", "-q",
+        "v4l2src", "device=/dev/video0", "en-awisp=1", "en-largemode=0", "do-timestamp=true", "!",
+        "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1", "!",
+        "tee", "name=t",
+        # WebRTC Hardware stream (Zero-Copy)
+        "t.", "!", "queue", "max-size-buffers=60", "!", "omxh264videoenc", "target-bitrate=8000000", "!", "h264parse", "config-interval=1", "!", "rtspclientsink", "location=rtsp://127.0.0.1:8554/camera",
+        # OpenCV Python stdout stream
+        "t.", "!", "queue", "leaky=1", "max-size-buffers=2", "!", "videoconvert", "!", "video/x-raw,format=BGR", "!", "fdsink"
+    ]
+    
+    p = subprocess.Popen(gst_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    t = threading.Thread(target=npu_inference_thread)
+    t.start()
+    
+    ft = threading.Thread(target=flask_thread)
+    ft.daemon = True
+    ft.start()
+
+    print("[MAIN] Pipeline fully running! Reading from stdout...", flush=True)
+    try:
+        while True:
+            raw_frame = read_exact(p.stdout, FRAME_SIZE)
+            if not raw_frame:
+                print("[MAIN] Camera read failed or EOF")
+                break
+                
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((FRAME_H, FRAME_W, 3))
+            
+            with frame_lock:
+                latest_frame = frame
+                
+    except KeyboardInterrupt:
+        print("[MAIN] Interrupted by user.")
+    finally:
+        running = False
+        p.terminate()
+
+if __name__ == "__main__":
+    main()
