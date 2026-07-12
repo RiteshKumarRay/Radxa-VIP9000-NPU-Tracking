@@ -115,7 +115,7 @@ def sigmoid(x):
 
 # ── YOLOv5 decoder ────────────────────────────────────────────────────
 def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
-                  conf_thresh=0.4, iou_thresh=0.45):
+                  conf_thresh=0.25, iou_thresh=0.45):
     """
     Decode 3-head YOLOv5 output into person detections.
     Each head shape: (3, Hg, Wg, 5+NC), stride=8/16/32.
@@ -132,38 +132,42 @@ def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
             continue
 
         arr = np.ctypeslib.as_array(raw_bufs[head_i], shape=(n,)).copy()
-        # The v3 model outputs are NCHW: (1, 255, H, W) -> reshaped to (3, 85, H, W)
-        arr = arr.reshape(3, 85, grid_h, grid_w)
+        arr = arr.reshape(3, grid_h, grid_w, 5 + NC)
         arr = sigmoid(arr)
 
         # Build grid
         gy, gx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
 
         for a_i, (aw, ah) in enumerate(anchors):
-            pred = arr[a_i]  # (85, grid_h, grid_w)
+            pred = arr[a_i]  # (grid_h, grid_w, 5+NC)
 
-            obj  = pred[4]          # objectness (grid_h, grid_w)
-            cls  = pred[5:]         # class probs (80, grid_h, grid_w)
-            person_conf = obj * cls[PERSON_IDX]  # (grid_h, grid_w)
+            obj  = pred[..., 4]          # objectness
+            cls  = pred[..., 5:]         # class probs
+            person_conf = obj * cls[..., PERSON_IDX]  # (Hg, Wg)
 
             # Lowered threshold to see if we get faint detections
-            mask = person_conf > 0.05
+            mask = person_conf > 0.01
             if not mask.any():
                 continue
 
             # Decode boxes for valid anchors
-            px = (pred[0][mask] * 2 - 0.5 + gx[mask]) * stride  # pixel cx
-            py = (pred[1][mask] * 2 - 0.5 + gy[mask]) * stride  # pixel cy
-            pw = (pred[2][mask] * 2) ** 2 * aw                   # pixel w
-            ph = (pred[3][mask] * 2) ** 2 * ah                   # pixel h
+            px = (pred[mask, 0] * 2 - 0.5 + gx[mask]) * stride  # pixel cx
+            py = (pred[mask, 1] * 2 - 0.5 + gy[mask]) * stride  # pixel cy
+            pw = (pred[mask, 2] * 2) ** 2 * aw                   # pixel w
+            ph = (pred[mask, 3] * 2) ** 2 * ah                   # pixel h
 
-            # Scale to original image
-            sx = orig_w / INPUT_W
-            sy = orig_h / INPUT_H
-            x1 = (px - pw / 2) * sx
-            y1 = (py - ph / 2) * sy
-            x2 = (px + pw / 2) * sx
-            y2 = (py + ph / 2) * sy
+            # Scale to original image (Letterbox un-padding)
+            scale = min(INPUT_W / orig_w, INPUT_H / orig_h)
+            dw = (INPUT_W - orig_w * scale) / 2
+            dh = (INPUT_H - orig_h * scale) / 2
+            
+            px_unpad = px - dw
+            py_unpad = py - dh
+            
+            x1 = (px_unpad - pw / 2) / scale
+            y1 = (py_unpad - ph / 2) / scale
+            x2 = (px_unpad + pw / 2) / scale
+            y2 = (py_unpad + ph / 2) / scale
 
             scores = person_conf[mask]
             for j in range(len(scores)):
@@ -237,10 +241,19 @@ def npu_inference():
 
         orig_h, orig_w = frame.shape[:2]
 
-        # Preprocess: resize → RGB → uint8 (NCHW)
-        img = cv2.resize(frame, (INPUT_W, INPUT_H))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        inp = img.transpose(2, 0, 1).astype(np.uint8).flatten()
+        # Preprocess: Letterbox → RGB → uint8 (NCHW)
+        scale = min(INPUT_W / orig_w, INPUT_H / orig_h)
+        nw, nh = int(orig_w * scale), int(orig_h * scale)
+        img_resized = cv2.resize(frame, (nw, nh))
+        
+        # Pad with gray (114)
+        img_pad = np.full((INPUT_H, INPUT_W, 3), 114, dtype=np.uint8)
+        dw = (INPUT_W - nw) // 2
+        dh = (INPUT_H - nh) // 2
+        img_pad[dh:dh+nh, dw:dw+nw, :] = img_resized
+
+        img_rgb = cv2.cvtColor(img_pad, cv2.COLOR_BGR2RGB)
+        inp = img_rgb.transpose(2, 0, 1).astype(np.uint8).flatten()
         buf = inp.ctypes.data_as(ctypes.c_void_p)
         bufs = (ctypes.c_void_p * 1)(buf)
 
