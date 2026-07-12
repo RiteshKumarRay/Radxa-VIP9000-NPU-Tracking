@@ -23,7 +23,7 @@ Furthermore, by orchestrating the process teardown with forceful system kills (`
 Instead of fighting GStreamer memory leaks in Python, we use a single, rock-solid GStreamer CLI subprocess (`gst-launch-1.0`) to split the hardware feed into two independent branches:
 
 1. **Zero-Copy WebRTC (H.264):** One branch of the `tee` pipes pristine 1080p frames directly into the silicon `omxh264videoenc` hardware encoder. This streams to the web at 0% CPU load with perfect colors.
-2. **Decoupled `fdsink` Capture:** The second branch converts the frames to flat `BGR` bytes and pipes them to `stdout` via `fdsink`. Python simply reads this byte-stream safely from standard output. Because we aren't mapping shared memory buffers, the kernel deadlocks are **physically impossible** in this architecture.
+2. **Decoupled `fdsink` Capture:** The second branch converts the frames to flat `BGR` bytes and pipes them to `stdout` via `fdsink`. Python simply reads this byte-stream safely from standard output. Because we aren't mapping shared memory buffers, this eliminates the shared-memory buffer negotiation path where the deadlock occurs.
 
 ## What's in this Repository?
 We have provided everything needed to bypass the bugs and get the Vivante VIP9000 working cleanly:
