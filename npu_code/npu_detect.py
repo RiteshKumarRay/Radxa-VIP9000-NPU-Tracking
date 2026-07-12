@@ -235,10 +235,10 @@ def npu_inference():
 
         orig_h, orig_w = frame.shape[:2]
 
-        # Preprocess: resize → RGB → uint8
+        # Preprocess: resize → RGB → uint8 (NCHW)
         img = cv2.resize(frame, (INPUT_W, INPUT_H))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        inp = img.astype(np.uint8).flatten()
+        inp = img.transpose(2, 0, 1).astype(np.uint8).flatten()
         buf = inp.ctypes.data_as(ctypes.c_void_p)
         bufs = (ctypes.c_void_p * 1)(buf)
 
