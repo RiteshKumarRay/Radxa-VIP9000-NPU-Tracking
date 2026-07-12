@@ -1,4 +1,4 @@
-# Radxa VIP9000 Hardware-Accelerated YOLOv5 Pipeline
+# Radxa VIP9000 Hardware-Accelerated YOLOv5 Pipeline.
 
 This repository provides an ultra-optimized, zero-copy architecture for running a live camera stream and YOLOv5s real-time person detection on Radxa boards equipped with the Allwinner ISP and Vivante VIP9000 NPU (e.g., Radxa ZERO 3W, Cubie A7S).
 
