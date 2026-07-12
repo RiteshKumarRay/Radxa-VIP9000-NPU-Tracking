@@ -132,28 +132,30 @@ def decode_yolov5(raw_bufs, out_elems, orig_h, orig_w,
             continue
 
         arr = np.ctypeslib.as_array(raw_bufs[head_i], shape=(n,)).copy()
-        arr = arr.reshape(3, grid_h, grid_w, 5 + NC)
+        # The v3 model outputs are NCHW: (1, 255, H, W) -> reshaped to (3, 85, H, W)
+        arr = arr.reshape(3, 85, grid_h, grid_w)
         arr = sigmoid(arr)
 
         # Build grid
         gy, gx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
 
         for a_i, (aw, ah) in enumerate(anchors):
-            pred = arr[a_i]  # (grid_h, grid_w, 5+NC)
+            pred = arr[a_i]  # (85, grid_h, grid_w)
 
-            obj  = pred[..., 4]          # objectness
-            cls  = pred[..., 5:]         # class probs
-            person_conf = obj * cls[..., PERSON_IDX]  # (Hg, Wg)
+            obj  = pred[4]          # objectness (grid_h, grid_w)
+            cls  = pred[5:]         # class probs (80, grid_h, grid_w)
+            person_conf = obj * cls[PERSON_IDX]  # (grid_h, grid_w)
 
-            mask = person_conf > conf_thresh
+            # Lowered threshold to see if we get faint detections
+            mask = person_conf > 0.05
             if not mask.any():
                 continue
 
             # Decode boxes for valid anchors
-            px = (pred[mask, 0] * 2 - 0.5 + gx[mask]) * stride  # pixel cx
-            py = (pred[mask, 1] * 2 - 0.5 + gy[mask]) * stride  # pixel cy
-            pw = (pred[mask, 2] * 2) ** 2 * aw                   # pixel w
-            ph = (pred[mask, 3] * 2) ** 2 * ah                   # pixel h
+            px = (pred[0][mask] * 2 - 0.5 + gx[mask]) * stride  # pixel cx
+            py = (pred[1][mask] * 2 - 0.5 + gy[mask]) * stride  # pixel cy
+            pw = (pred[2][mask] * 2) ** 2 * aw                   # pixel w
+            ph = (pred[3][mask] * 2) ** 2 * ah                   # pixel h
 
             # Scale to original image
             sx = orig_w / INPUT_W
