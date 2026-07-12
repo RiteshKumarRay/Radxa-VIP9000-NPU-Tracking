@@ -9,12 +9,16 @@ The objective of this project was to achieve **Real-Time NPU Object Detection** 
 If you try to build an NPU pipeline on these boards using standard tutorials, you will hit a massive wall. Specifically, the Allwinner ISP (`en-awisp=1`) and GStreamer's memory mapping interface have severe driver-level race conditions. 
 
 **What we faced:**
-1. **Kernel Panics & Lockups:** When attempting to capture video via OpenCV (`cv2.VideoCapture`), or when trying to map the GStreamer buffer into C/Python space, the pipeline deadlocks. Mutexes lock up (`__lll_lock_wait`), GStreamer throws `GST_IS_BUFFER` assertions, and the entire board freezes requiring a hard power cycle. (This is a [known issue in the Radxa community](https://forum.radxa.com/t/a7s-gstreamer-current-status-for-real-time-npu/31163)).
-2. **Color Space Glitches:** Forcing the pipeline through `videoconvert` triggers NV12/YV12 buffer sizing mismatches, resulting in horrible green and purple tints.
+1. **Kernel Panics & Lockups:** When attempting to capture video via OpenCV (`cv2.VideoCapture`), or when using software color conversion (`videoconvert`) to bridge the camera to the encoder, the pipeline deadlocks. Mutexes lock up (`__lll_lock_wait`), GStreamer throws `GST_IS_BUFFER` assertions, and the entire board freezes requiring a hard power cycle. (This is a [known, currently unresolved race condition in the Radxa community](https://forum.radxa.com/t/a7s-gstreamer-current-status-for-real-time-npu/31163) occurring during buffer-pool negotiation and pipeline teardown).
+2. **Color Space Glitches:** Forcing the pipeline through software `videoconvert` triggers NV12/YV12 buffer sizing mismatches, resulting in horrible green and purple tints.
 3. **CPU Bottlenecks:** Forcing the CPU to handle video encoding maxes out the processor, severely throttling the NPU inference frame rate.
 
-## The Solution: Dual-Branch `fdsink` Architecture
-We abandoned the broken shared-memory mapping approach entirely and architected a custom, decoupled pipeline that bypasses the ISP driver bugs.
+## The Solution: Native NV12 Bypass & Dual-Branch `fdsink`
+We abandoned the broken software conversion and shared-memory mapping approach entirely. We architected a custom, decoupled pipeline that bypasses the ISP driver bugs by relying strictly on native hardware formats.
+
+The key breakthrough is that the Allwinner ISP (`v4l2src en-awisp=1`) natively outputs **NV12** pixel format, and the hardware encoder (`omxh264videoenc`) natively expects **NV12**. By removing the software `videoconvert` step entirely from the encoding branch, we bypassed the exact buffer negotiation crash confirmed by other developers. 
+
+Furthermore, by orchestrating the process teardown with forceful system kills (`pkill -9`) rather than graceful GStreamer `PLAYING -> NULL` state transitions, we made the architecture completely immune to the `gst_pad_stop_task` teardown deadlocks that plague this SoC.
 
 Instead of fighting GStreamer memory leaks in Python, we use a single, rock-solid GStreamer CLI subprocess (`gst-launch-1.0`) to split the hardware feed into two independent branches:
 
