@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# C binaries
+*.o
+*.so
+# (We ignore .so files as they are compiled for Radxa's architecture. Users should compile the shim on the board itself.)
+
+# Log files
+*.log
