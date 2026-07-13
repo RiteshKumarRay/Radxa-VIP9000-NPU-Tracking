@@ -12,10 +12,6 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 
-// GStreamer
-#include <gst/gst.h>
-#include <gst/app/gstappsink.h>
-
 // Web Server
 #include "httplib.h"
 
@@ -239,126 +235,47 @@ void npu_inference_thread() {
     awnn_uninit();
 }
 
-// ── GStreamer AppSink Callback ───────────────────────────────────────────────
-GstFlowReturn on_new_sample(GstElement* sink, gpointer user_data) {
-    GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-    if (!sample) return GST_FLOW_ERROR;
-
-    GstBuffer* buffer = gst_sample_get_buffer(sample);
-    GstMapInfo map;
-    
-    if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-        // We expect BGR frames from videoconvert 
-        Mat frame(FRAME_H, FRAME_W, CV_8UC3, (void*)map.data);
-        
-        {
-            lock_guard<mutex> lock(g_frame_mutex);
-            // Copy data so we can unmap the buffer quickly and return it to GStreamer
-            frame.copyTo(g_latest_frame); 
-        }
-
-        gst_buffer_unmap(buffer, &map);
-    }
-
-    gst_sample_unref(sample);
-    return GST_FLOW_OK;
-}
-
-// ── Web Server ───────────────────────────────────────────────────────────────
-void web_server_thread() {
-    httplib::Server svr;
-
-    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(
-            "<html><head><title>Radxa NPU Stream (C++)</title>"
-            "<style>body { background-color: #111; color: white; text-align: center; font-family: sans-serif; }"
-            "img { border: 2px solid #444; border-radius: 8px; max-width: 90%; margin-top: 20px; }</style>"
-            "</head><body><h1>NPU Person Detection (C++ Native)</h1><img src=\"/video_feed\" /></body></html>",
-            "text/html"
-        );
-    });
-
-    svr.Get("/video_feed", [](const httplib::Request&, httplib::Response& res) {
-        res.set_chunked_content_provider(
-            "multipart/x-mixed-replace; boundary=frame",
-            [](size_t offset, httplib::DataSink& sink) {
-                while (g_running) {
-                    Mat frame;
-                    vector<Detection> dets;
-
-                    {
-                        lock_guard<mutex> lock(g_frame_mutex);
-                        if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
-                    }
-                    {
-                        lock_guard<mutex> lock(g_det_mutex);
-                        dets = g_latest_detections;
-                    }
-
-                    if (!frame.empty()) {
-                        for (const auto& d : dets) {
-                            cv::rectangle(frame, d.bbox, Scalar(0, 255, 80), 3);
-                            string label = "Person " + to_string(d.score).substr(0,4);
-                            int baseline = 0;
-                            Size sz = cv::getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.8, 2, &baseline);
-                            cv::rectangle(frame, Point(d.bbox.x, d.bbox.y - sz.height - 10), Point(d.bbox.x + sz.width + 10, d.bbox.y), Scalar(0, 200, 60), -1);
-                            cv::putText(frame, label, Point(d.bbox.x + 5, d.bbox.y - 5), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 2, LINE_AA);
-                        }
-
-                        vector<uchar> buf;
-                        cv::imencode(".jpg", frame, buf);
-
-                        string header = "--frame\r\nContent-Type: image/jpeg\r\n\r\n";
-                        sink.write(header.data(), header.size());
-                        sink.write((const char*)buf.data(), buf.size());
-                        sink.write("\r\n\r\n", 4);
-                    }
-                    this_thread::sleep_for(chrono::milliseconds(33)); // ~30 FPS limit for MJPEG
-                }
-                return false; 
-            }
-        );
-    });
-
-    cout << "[WEB] Starting C++ HTTP Server on 0.0.0.0:5000" << endl;
-    svr.listen("0.0.0.0", 5000);
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    gst_init(&argc, &argv);
-
     string pipeline_str = 
+        "gst-launch-1.0 -q "
         "v4l2src device=/dev/video0 en-awisp=1 en-largemode=0 do-timestamp=true ! "
         "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! tee name=t "
         "t. ! queue max-size-buffers=60 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
-        "t. ! queue leaky=1 max-size-buffers=2 ! videoconvert ! video/x-raw,format=BGR ! appsink name=sink emit-signals=true max-buffers=1 drop=true";
+        "t. ! queue leaky=1 max-size-buffers=2 ! videoconvert ! video/x-raw,format=BGR ! fdsink";
 
-    cout << "[MAIN] Launching GStreamer C++ Pipeline..." << endl;
-    GError* err = nullptr;
-    GstElement* pipeline = gst_parse_launch(pipeline_str.c_str(), &err);
-    if (err) {
-        cerr << "GStreamer pipeline error: " << err->message << endl;
+    cout << "[MAIN] Launching GStreamer C++ Pipeline via popen()..." << endl;
+    FILE* pipe = popen(pipeline_str.c_str(), "r");
+    if (!pipe) {
+        cerr << "Failed to start GStreamer pipeline!" << endl;
         return -1;
     }
-
-    GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
-    g_signal_connect(sink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
-
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
     thread npu_thread(npu_inference_thread);
     thread web_thread(web_server_thread);
 
-    cout << "[MAIN] All threads running. Press Enter to exit." << endl;
-    cin.get();
+    cout << "[MAIN] All threads running. Reading from stdout..." << endl;
+    
+    size_t frame_size = FRAME_W * FRAME_H * 3;
+    vector<uint8_t> buffer(frame_size);
+
+    while (g_running) {
+        size_t bytes_read = fread(buffer.data(), 1, frame_size, pipe);
+        if (bytes_read != frame_size) {
+            cerr << "[MAIN] Camera stream ended or failed to read full frame." << endl;
+            break;
+        }
+
+        Mat frame(FRAME_H, FRAME_W, CV_8UC3, buffer.data());
+        {
+            lock_guard<mutex> lock(g_frame_mutex);
+            frame.copyTo(g_latest_frame);
+        }
+    }
 
     cout << "[MAIN] Shutting down..." << endl;
     g_running = false;
-
-    // Do NOT gracefully shut down GStreamer to avoid gst_pad_stop_task deadlock!
-    // We will just exit() and let the OS forcefully reclaim everything.
-    exit(0);
+    pclose(pipe);
 
     return 0;
 }

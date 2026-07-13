@@ -15,7 +15,7 @@ fi
 echo "Compiling..."
 g++ -O3 npu_detect.cpp awnn_shim.c -o npu_detect_cpp \
     -I. \
-    $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 opencv4) \
+    $(pkg-config --cflags --libs opencv4) \
     -lNBGlinker -lVIPhal -lpthread
 
 if [ $? -eq 0 ]; then
