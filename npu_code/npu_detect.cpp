@@ -193,15 +193,16 @@ void npu_inference_thread() {
         Mat img_rgb;
         cv::cvtColor(img_pad, img_rgb, COLOR_BGR2RGB);
 
-        // HWC to CHW (NCHW)
+        // HWC to CHW (NCHW) - Optimized using OpenCV vectorized split
+        vector<Mat> channels;
+        cv::split(img_rgb, channels);
+        
         vector<uint8_t> chw_data(INPUT_H * INPUT_W * 3);
         int stride = INPUT_H * INPUT_W;
-        for (int c = 0; c < 3; ++c) {
-            for (int i = 0; i < stride; ++i) {
-                chw_data[c * stride + i] = img_rgb.data[i * 3 + c];
-            }
-        }
-
+        memcpy(chw_data.data(), channels[0].data, stride);
+        memcpy(chw_data.data() + stride, channels[1].data, stride);
+        memcpy(chw_data.data() + 2 * stride, channels[2].data, stride);
+        
         void* buf_ptr = chw_data.data();
         void** bufs = &buf_ptr;
 
@@ -301,7 +302,7 @@ int main(int argc, char* argv[]) {
         "gst-launch-1.0 -q "
         "v4l2src device=/dev/video0 en-awisp=1 en-largemode=0 do-timestamp=true ! "
         "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! tee name=t "
-        "t. ! queue max-size-buffers=60 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
+        "t. ! queue leaky=1 max-size-buffers=2 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
         "t. ! queue leaky=1 max-size-buffers=2 ! videoconvert ! video/x-raw,format=BGR ! fdsink";
 
     cout << "[MAIN] Launching GStreamer C++ Pipeline via popen()..." << endl;

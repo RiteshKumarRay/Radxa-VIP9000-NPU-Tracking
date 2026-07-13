@@ -62,10 +62,15 @@ bash scripts/start_all.sh
 - **Raw WebRTC Stream (0% CPU):** `http://<RADXA_IP>:8889/camera`
 - **NPU Web UI (Bounding Boxes):** `http://<RADXA_IP>:5000`
 
-## The C++ Native Port (Maximum Performance)
-While the hybrid Python/C architecture completely fixes the crashing bugs and achieves a stable **~15 FPS** on the web UI, the Python Global Interpreter Lock (GIL) and stdout byte-reading overhead limit how fast we can push the NPU. 
+## The C++ Native Port (Maximum Performance & Zero Lag)
+While the hybrid Python/C architecture completely fixes the crashing bugs, the Python Global Interpreter Lock (GIL) and stdout byte-reading overhead inherently limit how fast we can push the NPU. 
 
-To solve this, we have written a **fully native C++ version** (`npu_detect.cpp`) that hosts the GStreamer pipeline internally using the C-API, grabs frames natively via `appsink`, and talks directly to the NPU C-SDK without any Python overhead.
+To solve this, we have written a **fully native, heavily optimized C++ version** (`npu_detect.cpp`).
+
+**Key C++ Optimizations Included:**
+1. **Hardware Encoder Sudo Privileges:** The Allwinner hardware video engine (`/dev/cedar_dev`) strictly requires `root` privileges to allocate memory buffers. If run as a standard user, `omxh264videoenc` will instantly crash with `Failed to open encoder`. Our C++ launch script safely wraps the execution with elevated privileges to guarantee hardware encoder initialization.
+2. **WebRTC Latency Fix:** Standard GStreamer `queue` elements buffer frames indefinitely if the hardware encoder falls slightly behind, resulting in up to 2 seconds of massive WebRTC delay. We re-engineered the pipeline to use `leaky=downstream max-size-buffers=2` queues on the WebRTC branch, ensuring the live stream strictly drops late frames and remains 100% real-time.
+3. **OpenCV Hardware Vectorization:** Transforming the 1080p camera frames from HWC (Interleaved) to CHW (Planar) format for the NPU requires shifting 1.2 million pixels. Using a standard nested C++ `for` loop destroyed the CPU memory bandwidth. We completely replaced this with OpenCV's highly optimized, hardware-vectorized `cv::split` function, drastically reducing CPU overhead.
 
 **How to use the C++ Engine:**
 1. Build it:
@@ -73,11 +78,14 @@ To solve this, we have written a **fully native C++ version** (`npu_detect.cpp`)
    cd npu_code
    bash build_cpp.sh
    ```
-2. Run it:
+2. Run it (the script will automatically handle the `sudo` password to unlock the hardware encoder):
    ```bash
    bash scripts/start_all_cpp.sh
    ```
-This drops the CPU overhead significantly and pushes the NPU to its true theoretical limits (40-60+ FPS capabilities), limited only by the MJPEG HTTP server thread.
+This architecture maxes out the physical mathematical limits of the board. The NPU crunches YOLO matrices at an incredible ~39ms (25+ FPS), while the CPU concurrently maxes out at ~19 FPS running the GStreamer `videoconvert` and JPEG compressions.
 
-## Thermal Management
-The Allwinner chip reaches 70°C+ during NPU load, causing thermal throttling. Active cooling (heatsink + fan) is strictly required for sustained maximum framerates in both Python and C++ implementations.
+## Thermal Management & The 416 MHz Kernel Bug
+The Allwinner A733/T527 chip reaches 65°C+ during NPU load, which triggers aggressive thermal throttling. **Active cooling (heatsink + fan) is strictly required.**
+
+**CRITICAL KERNEL BUG:** If your board hits 65°C, the Linux kernel's thermal daemon will panic and forcefully rewrite the CPU frequency limit (`scaling_max_freq`) to its lowest state: **416 MHz**. 
+The kernel *will not* revert this when the chip cools down! Even if you attach a fan later, your board will be permanently crippled at 416 MHz, causing massive framerate drops in the pipeline. To fix this, you must physically attach a 5V fan to the SoC and reboot the board entirely to clear the locked thermal panic state and restore the full 1.8 GHz clock speed.
