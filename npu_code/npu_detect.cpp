@@ -302,7 +302,7 @@ int main(int argc, char* argv[]) {
         "gst-launch-1.0 -q "
         "v4l2src device=/dev/video0 en-awisp=1 en-largemode=0 do-timestamp=true ! "
         "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! tee name=t "
-        "t. ! queue leaky=2 max-size-buffers=2 ! omxh264videoenc target-bitrate=20000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
+        "t. ! queue leaky=2 max-size-buffers=2 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
         "t. ! queue leaky=2 max-size-buffers=2 ! videoscale ! video/x-raw,width=640,height=360 ! videoconvert ! video/x-raw,format=BGR ! fdsink";
 
     cout << "[MAIN] Launching GStreamer C++ Pipeline via popen()..." << endl;
