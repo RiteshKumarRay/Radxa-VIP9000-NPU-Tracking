@@ -36,8 +36,8 @@ const char* NPU_MODEL = "/home/radxa/npu/yolov5s.nb";
 
 const int INPUT_H = 640;
 const int INPUT_W = 640;
-const int FRAME_W = 1920;
-const int FRAME_H = 1080;
+const int FRAME_W = 854;
+const int FRAME_H = 480;
 
 const int NC = 80;
 const int PERSON_IDX = 0;
@@ -302,8 +302,8 @@ int main(int argc, char* argv[]) {
         "gst-launch-1.0 -q "
         "v4l2src device=/dev/video0 en-awisp=1 en-largemode=0 do-timestamp=true ! "
         "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! tee name=t "
-        "t. ! queue leaky=1 max-size-buffers=2 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
-        "t. ! queue leaky=1 max-size-buffers=2 ! videoconvert ! video/x-raw,format=BGR ! fdsink";
+        "t. ! queue leaky=2 max-size-buffers=2 ! omxh264videoenc target-bitrate=8000000 ! h264parse config-interval=1 ! rtspclientsink location=rtsp://127.0.0.1:8554/camera "
+        "t. ! queue leaky=2 max-size-buffers=2 ! videoscale ! video/x-raw,width=854,height=480 ! videoconvert ! video/x-raw,format=BGR ! fdsink";
 
     cout << "[MAIN] Launching GStreamer C++ Pipeline via popen()..." << endl;
     FILE* pipe = popen(pipeline_str.c_str(), "r");
