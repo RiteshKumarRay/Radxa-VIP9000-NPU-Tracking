@@ -235,6 +235,66 @@ void npu_inference_thread() {
     awnn_uninit();
 }
 
+// ── Web Server ───────────────────────────────────────────────────────────────
+void web_server_thread() {
+    httplib::Server svr;
+
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(
+            "<html><head><title>Radxa NPU Stream (C++)</title>"
+            "<style>body { background-color: #111; color: white; text-align: center; font-family: sans-serif; }"
+            "img { border: 2px solid #444; border-radius: 8px; max-width: 90%; margin-top: 20px; }</style>"
+            "</head><body><h1>NPU Person Detection (C++ Native)</h1><img src=\"/video_feed\" /></body></html>",
+            "text/html"
+        );
+    });
+
+    svr.Get("/video_feed", [](const httplib::Request&, httplib::Response& res) {
+        res.set_chunked_content_provider(
+            "multipart/x-mixed-replace; boundary=frame",
+            [](size_t offset, httplib::DataSink& sink) {
+                while (g_running) {
+                    Mat frame;
+                    vector<Detection> dets;
+
+                    {
+                        lock_guard<mutex> lock(g_frame_mutex);
+                        if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+                    }
+                    {
+                        lock_guard<mutex> lock(g_det_mutex);
+                        dets = g_latest_detections;
+                    }
+
+                    if (!frame.empty()) {
+                        for (const auto& d : dets) {
+                            cv::rectangle(frame, d.bbox, Scalar(0, 255, 80), 3);
+                            string label = "Person " + to_string(d.score).substr(0,4);
+                            int baseline = 0;
+                            Size sz = cv::getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.8, 2, &baseline);
+                            cv::rectangle(frame, Point(d.bbox.x, d.bbox.y - sz.height - 10), Point(d.bbox.x + sz.width + 10, d.bbox.y), Scalar(0, 200, 60), -1);
+                            cv::putText(frame, label, Point(d.bbox.x + 5, d.bbox.y - 5), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 2, LINE_AA);
+                        }
+
+                        vector<uchar> buf;
+                        cv::imencode(".jpg", frame, buf);
+
+                        string header = "--frame\r\nContent-Type: image/jpeg\r\n\r\n";
+                        sink.write(header.data(), header.size());
+                        sink.write((const char*)buf.data(), buf.size());
+                        sink.write("\r\n\r\n", 4);
+                    }
+                    this_thread::sleep_for(chrono::milliseconds(33)); // ~30 FPS limit for MJPEG
+                }
+                return false; 
+            }
+        );
+    });
+
+    cout << "[WEB] Starting C++ HTTP Server on 0.0.0.0:5000" << endl;
+    svr.listen("0.0.0.0", 5000);
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     string pipeline_str = 

@@ -11,9 +11,13 @@ if [ ! -f "httplib.h" ]; then
     wget -q https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h -O httplib.h
 fi
 
-# Compile the C++ file along with the C shim
-echo "Compiling..."
-g++ -O3 npu_detect.cpp awnn_shim.c -o npu_detect_cpp \
+# Compile the C shim separately as C code
+echo "Compiling C shim..."
+gcc -c -fPIC awnn_shim.c -o awnn_shim.o -I.
+
+# Compile the C++ file and link
+echo "Compiling C++ engine..."
+g++ -O3 npu_detect.cpp awnn_shim.o -o npu_detect_cpp \
     -I. \
     $(pkg-config --cflags --libs opencv4) \
     -lNBGlinker -lVIPhal -lpthread
