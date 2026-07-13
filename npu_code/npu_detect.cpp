@@ -312,7 +312,10 @@ int main(int argc, char* argv[]) {
     }
 
     thread npu_thread(npu_inference_thread);
+    npu_thread.detach();
+    
     thread web_thread(web_server_thread);
+    web_thread.detach();
 
     cout << "[MAIN] All threads running. Reading from stdout..." << endl;
     
