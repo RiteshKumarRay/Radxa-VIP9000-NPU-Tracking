@@ -62,9 +62,22 @@ bash scripts/start_all.sh
 - **Raw WebRTC Stream (0% CPU):** `http://<RADXA_IP>:8889/camera`
 - **NPU Web UI (Bounding Boxes):** `http://<RADXA_IP>:5000`
 
-## Future Improvements & Roadmap
-While this hybrid Python/C architecture completely fixes the crashing bugs and achieves a stable **~15 FPS** on the web UI, the Python Global Interpreter Lock (GIL) and stdout byte-reading overhead limit how fast we can push the NPU. (The NPU itself infers at 30+ FPS, but the Python overhead of parsing bytes and encoding JPEGs drops the final web UI output to ~15 FPS).
+## The C++ Native Port (Maximum Performance)
+While the hybrid Python/C architecture completely fixes the crashing bugs and achieves a stable **~15 FPS** on the web UI, the Python Global Interpreter Lock (GIL) and stdout byte-reading overhead limit how fast we can push the NPU. 
 
-**Next Steps for Maximum Performance:**
-1. **Full C++ Port:** We plan to move the `npu_detect.py` logic entirely into C++ as a native GStreamer plugin (e.g., `awinnsink`). By keeping the entire pipeline in C-space and bypassing Python's `fdsink` overhead entirely, the VIP9000 NPU can easily process **40 to 60+ FPS** with sub-10% CPU load.
-2. **Thermal Management:** The Allwinner chip reaches 70°C+ during NPU load, causing thermal throttling. Active cooling (heatsink + fan) is strictly required for sustained maximum framerates.
+To solve this, we have written a **fully native C++ version** (`npu_detect.cpp`) that hosts the GStreamer pipeline internally using the C-API, grabs frames natively via `appsink`, and talks directly to the NPU C-SDK without any Python overhead.
+
+**How to use the C++ Engine:**
+1. Build it:
+   ```bash
+   cd npu_code
+   bash build_cpp.sh
+   ```
+2. Run it:
+   ```bash
+   bash scripts/start_all_cpp.sh
+   ```
+This drops the CPU overhead significantly and pushes the NPU to its true theoretical limits (40-60+ FPS capabilities), limited only by the MJPEG HTTP server thread.
+
+## Thermal Management
+The Allwinner chip reaches 70°C+ during NPU load, causing thermal throttling. Active cooling (heatsink + fan) is strictly required for sustained maximum framerates in both Python and C++ implementations.
