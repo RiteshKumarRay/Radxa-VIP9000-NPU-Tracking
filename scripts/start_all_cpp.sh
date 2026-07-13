@@ -21,7 +21,7 @@ echo "      WebRTC  OK — http://$IP:8889/camera"
 echo "[2/2] Starting C++ NPU Native Pipeline..."
 export LD_LIBRARY_PATH=/home/radxa/npu
 cd /home/radxa/npu
-nohup ./npu_detect_cpp > /tmp/npu_detect_cpp.log 2>&1 &
+nohup bash -c 'echo "radxa" | sudo -S LD_LIBRARY_PATH=/home/radxa/npu ./npu_detect_cpp' > /tmp/npu_detect_cpp.log 2>&1 &
 NPU_PID=$!
 sleep 3
 
